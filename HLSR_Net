@@ -1,0 +1,378 @@
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.convnext import convnext_tiny
+from timm.models.layers import DropPath
+
+# ==================== 基础模块 ====================
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_channels + skip_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.size()[2:] != skip.size()[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+# ==================== 频域分解模块 ====================
+
+class LightweightFrequencyDecomposer(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.adaptive_weight = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        low_freq_base = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
+        high_freq_base = x - low_freq_base
+
+        weights = self.adaptive_weight(x)
+        low_weight, high_weight = weights[:, 0:1], weights[:, 1:2]
+
+        low_freq = low_freq_base * (0.8 + 0.4 * low_weight)
+        high_freq = high_freq_base * (0.8 + 0.4 * high_weight)
+
+        return low_freq, high_freq
+
+class FixedSimplifiedDEAMAttention(nn.Module):
+    def __init__(self, in_dim, ds=8):
+        super().__init__()
+        self.in_dim = in_dim
+        self.key_channel = in_dim // 8
+        self.ds = ds
+
+        self.pool = nn.AvgPool2d(self.ds)
+        self.query_conv = nn.Conv2d(in_dim, self.key_channel, 1)
+        self.key_conv = nn.Conv2d(in_dim, self.key_channel, 1)
+        self.value_conv = nn.Conv2d(in_dim, in_dim, 1)
+
+        self.diff_processor = nn.Sequential(
+            nn.Conv2d(in_dim, in_dim//8, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_dim//8, 1, 1),
+            nn.Sigmoid()
+        )
+
+        self.gamma = nn.Parameter(torch.zeros(1))
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        original_size = x.shape[2:]
+        x_down = self.pool(x)
+        m_batchsize, C, width, height = x_down.size()
+
+        proj_query = self.query_conv(x_down).view(m_batchsize, -1, width * height).permute(0, 2, 1)
+        proj_key = self.key_conv(x_down).view(m_batchsize, -1, width * height)
+        proj_value = self.value_conv(x_down).view(m_batchsize, -1, width * height)
+
+        energy = torch.bmm(proj_query, proj_key)
+        energy = (self.key_channel ** -0.5) * energy
+        attention = self.softmax(energy)
+
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(m_batchsize, C, width, height)
+
+        diff_weight = self.diff_processor(x_down)
+        out = out * (1 + diff_weight)
+
+        out = F.interpolate(out, size=original_size, mode='bilinear', align_corners=False)
+        return self.gamma * out + x
+
+class LightweightBoundaryAwareDense(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dense_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim, 3, padding=1, groups=dim//4),
+                nn.BatchNorm2d(dim),
+                nn.GELU(),
+                nn.Conv2d(dim, dim, 1, groups=4),
+                nn.BatchNorm2d(dim)
+            ) for _ in range(3)
+        ])
+
+        self.boundary_detector = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, dim//16, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(dim//16, 1, 1),
+            nn.Sigmoid()
+        )
+
+        self.fusion = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x):
+        identity = x
+        features = [x]
+
+        for i, block in enumerate(self.dense_blocks):
+            inp = features[0] if i == 0 else sum(features)
+            out = block(inp) + inp
+            features.append(out)
+
+        final_feature = self.fusion(features[-1])
+        boundary_weight = self.boundary_detector(identity)
+        enhanced = final_feature * boundary_weight + final_feature
+
+        return enhanced + identity
+
+# ==================== 编码器 ====================
+
+class SimplifiedFrequencyEncoder(nn.Module):
+    def __init__(self, pretrained=False):
+        super().__init__()
+        backbone = convnext_tiny(weights='IMAGENET1K_V1' if pretrained else None)
+
+        self.encoder_layers = nn.ModuleList([
+            backbone.features[0],  # stem: /4, 96
+            backbone.features[2],  # stage1: /8, 192
+            backbone.features[4],  # stage2: /16, 384
+            backbone.features[6],  # stage3: /32, 768
+        ])
+
+        self.feature_dims = [96, 192, 384, 768]
+
+        self.freq_decomposers = nn.ModuleList([
+            LightweightFrequencyDecomposer(dim) for dim in self.feature_dims
+        ])
+
+        self.low_freq_processors = nn.ModuleList([
+            FixedSimplifiedDEAMAttention(dim) for dim in self.feature_dims
+        ])
+
+        self.high_freq_processors = nn.ModuleList([
+            LightweightBoundaryAwareDense(dim) for dim in self.feature_dims
+        ])
+
+    def forward(self, x):
+        features = []
+        temp_x = x
+
+        for i, layer in enumerate(self.encoder_layers):
+            temp_x = layer(temp_x)
+            low_freq, high_freq = self.freq_decomposers[i](temp_x)
+            enhanced_low = self.low_freq_processors[i](low_freq)
+            enhanced_high = self.high_freq_processors[i](high_freq)
+            enhanced_feature = enhanced_low + enhanced_high
+            features.append(enhanced_feature)
+
+        return features
+
+# ==================== Star_Block模块 ====================
+
+class ConvBN(nn.Module):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1):
+        super().__init__()
+        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
+        self.conv = nn.Conv2d(c1, c2, k, s, p, groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+
+    def forward(self, x):
+        return self.bn(self.conv(x))
+
+class Star_Block(nn.Module):
+    def __init__(self, dim, mlp_ratio=2, drop_path=0.):
+        super().__init__()
+        self.dwconv = ConvBN(dim, dim, 7, g=dim)
+        self.f1 = nn.Conv2d(dim, mlp_ratio * dim, 1)
+        self.f2 = nn.Conv2d(dim, mlp_ratio * dim, 1)
+        self.g = ConvBN(mlp_ratio * dim, dim, 1)
+        self.dwconv2 = nn.Conv2d(dim, dim, 7, 1, (7 - 1) // 2, groups=dim)
+        self.act = nn.ReLU6()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x1, x2 = self.f1(x), self.f2(x)
+        x = self.act(x1) * x2
+        x = self.g(x)
+        x = self.dwconv2(x)
+        return input + self.drop_path(x)
+
+# ==================== S4.C2超精简解码器 ====================
+
+class Enhanced_LRCED_v2_S4C2(nn.Module):
+    def __init__(self, dim, drop_path=0.1, dilation=3):
+        super().__init__()
+        self.feature_transform = Star_Block(dim, mlp_ratio=2, drop_path=drop_path)
+
+    def forward(self, x):
+        return self.feature_transform(x)
+
+# ==================== HLSR_Net_F0 主网络 ====================
+
+class HLSR(nn.Module):
+    def __init__(self, num_classes=2, pretrained=False):
+        super().__init__()
+
+        self.encoder = SimplifiedFrequencyEncoder(pretrained=pretrained)
+
+        # 修改：瓶颈层压缩设计 768 → 512 → 512，stride=1（不下采样）
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(768, 512, 3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, stride=1, padding=1),  # stride=1，不下采样
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+
+        # 修改：up3 输入通道从 1024 改为 512
+        self.up3 = UpBlock(512, 768, 384)  # 输入通道改为 512
+        self.up2 = UpBlock(384, 384, 192)
+        self.up1 = UpBlock(192, 192, 96)
+        self.up0 = UpBlock(96, 96, 64)
+
+        self.decoder3 = Enhanced_LRCED_v2_S4C2(384, drop_path=0.1)
+        self.decoder2 = Enhanced_LRCED_v2_S4C2(192, drop_path=0.1)
+        self.decoder1 = Enhanced_LRCED_v2_S4C2(96, drop_path=0.1)
+        self.decoder0 = Enhanced_LRCED_v2_S4C2(64, drop_path=0.1)
+
+        self.final_conv = nn.Sequential(
+            nn.ConvTranspose2d(64, 32, 4, stride=4),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, num_classes, 1)
+        )
+
+    def forward(self, x):
+        features = self.encoder(x)
+        f0, f1, f2, f3 = features
+
+        bottleneck = self.bottleneck(f3)
+
+        d3 = self.up3(bottleneck, f3)
+        d3 = self.decoder3(d3)
+
+        d2 = self.up2(d3, f2)
+        d2 = self.decoder2(d2)
+
+        d1 = self.up1(d2, f1)
+        d1 = self.decoder1(d1)
+
+        d0 = self.up0(d1, f0)
+        d0 = self.decoder0(d0)
+
+        output = self.final_conv(d0)
+
+        if output.shape[2:] != x.shape[2:]:
+            output = F.interpolate(output, size=x.shape[2:], mode='bilinear', align_corners=False)
+
+        return output
+
+    def analyze_parameters_detailed(self):
+        """详细参数分析"""
+        import logging
+
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+        encoder_params = sum(p.numel() for p in self.encoder.parameters())
+        bottleneck_params = sum(p.numel() for p in self.bottleneck.parameters())
+
+        # 正确计算解码器参数（包括 up blocks 和 decoder blocks）
+        up_params = sum(p.numel() for p in self.up3.parameters()) + \
+                   sum(p.numel() for p in self.up2.parameters()) + \
+                   sum(p.numel() for p in self.up1.parameters()) + \
+                   sum(p.numel() for p in self.up0.parameters())
+        decoder_params = sum(p.numel() for p in self.decoder3.parameters()) + \
+                        sum(p.numel() for p in self.decoder2.parameters()) + \
+                        sum(p.numel() for p in self.decoder1.parameters()) + \
+                        sum(p.numel() for p in self.decoder0.parameters())
+        final_conv_params = sum(p.numel() for p in self.final_conv.parameters())
+
+        star_params = sum(p.numel() for p in self.decoder3.feature_transform.parameters()) + \
+                     sum(p.numel() for p in self.decoder2.feature_transform.parameters()) + \
+                     sum(p.numel() for p in self.decoder1.feature_transform.parameters()) + \
+                     sum(p.numel() for p in self.decoder0.feature_transform.parameters())
+
+        logging.info(f"🔥 HLSR 模型参数分析:")
+        logging.info(f"📊 总参数: {total_params:,} ({total_params/1e6:.2f}M)")
+        logging.info(f"📊 可训练参数: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+        logging.info(f"📊 编码器参数: {encoder_params:,} ({encoder_params/1e6:.2f}M)")
+        logging.info(f"📊 瓶颈层参数: {bottleneck_params:,} ({bottleneck_params/1e6:.2f}M)")
+        logging.info(f"📊 上采样参数: {up_params:,} ({up_params/1e6:.2f}M)")
+        logging.info(f"📊 解码器参数: {decoder_params:,} ({decoder_params/1e6:.2f}M)")
+        logging.info(f"📊 最终卷积参数: {final_conv_params:,} ({final_conv_params/1e6:.2f}M)")
+        logging.info(f"⭐ Star_Block参数: {star_params:,} ({star_params/1e6:.2f}M)")
+        logging.info(f"📊 Star占解码器比例: {star_params/decoder_params*100:.1f}%")
+        logging.info(f"📊 Star占总模型比例: {star_params/total_params*100:.1f}%")
+
+
+# ==================== 测试代码 ====================
+
+if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # 创建模型
+    model = HLSR(num_classes=2, pretrained=False)
+    model.eval()
+
+    # 测试输入 (使用更大的输入尺寸以获得更准确的 FLOPs 估计)
+    x = torch.randn(1, 3, 512, 512)
+    print("=" * 50)
+    print("HLSR_Net_F0 - 参数量和计算量分析")
+    print("=" * 50)
+
+    # 计算参数量
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    print("📊 参数统计:")
+    print(f"   总参数量: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"   可训练参数: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+
+    # 计算 FLOPs
+    try:
+        from thop import profile
+        print("\n🔥 使用 thop 计算 FLOPs...")
+
+        with torch.no_grad():
+            flops, params = profile(model, inputs=(x,))
+
+        print(f"   FLOPs: {flops/1e9:.2f}G")
+        print(f"   参数量: {params/1e6:.2f}M")
+
+    except ImportError:
+        print("\n⚠️  未安装 thop 库，跳过 FLOPs 计算")
+        print("   如需计算 FLOPs，请运行: pip install thop")
+
+    print("\n" + "=" * 50)
+    print("HLSR_Net_F0 - 网络前向传播测试")
+    print("=" * 50)
+
+    print(f"输入尺寸: {x.shape}")
+
+    # 前向传播
+    with torch.no_grad():
+        output = model(x)
+
+    print(f"输出尺寸: {output.shape}")
+
+    # 详细参数分析
+    print("\n" + "=" * 50)
+    model.analyze_parameters_detailed()
+
+    print("\n🎉 分析完成！")
+    print("=" * 50)
+
+
